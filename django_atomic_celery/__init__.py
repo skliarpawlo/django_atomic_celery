@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import logging
 import threading
 from collections import defaultdict
@@ -65,6 +66,22 @@ def _get_task_queues():
     return _thread_data.__dict__.setdefault('task_queues', defaultdict(list))
 
 
+def get_in_post_exit_atomic_block():
+    return _thread_data.__dict__.setdefault('is_in_postexit_block', [])
+
+
+def _is_in_post_exit_atomic_block():
+    return bool(get_in_post_exit_atomic_block())
+
+
+@contextmanager
+def _in_post_exit_atomic_block():
+    stack = get_in_post_exit_atomic_block()
+    stack.append(True)
+    yield
+    stack.pop()
+
+
 class PostTransactionTask(Task):
     """Task delayed until after the outermost atomic block is exited.
 
@@ -116,7 +133,9 @@ def _post_enter_atomic_block(signal,
     using = using or DEFAULT_DB_ALIAS
     task_queue_stack = _get_task_queues()[using]
 
-    if outermost:
+    in_post_exit_block = _is_in_post_exit_atomic_block()
+
+    if outermost and not in_post_exit_block:
         task_queue_stack[:] = []
 
     task_queue_stack.append([])
@@ -133,25 +152,26 @@ def _post_exit_atomic_block(signal,
     if not savepoint:
         return
 
-    using = using or DEFAULT_DB_ALIAS
-    task_queue_stack = _get_task_queues()[using]
+    with _in_post_exit_atomic_block():
+        using = using or DEFAULT_DB_ALIAS
+        task_queue_stack = _get_task_queues()[using]
 
-    if successful:
-        if len(task_queue_stack) == 1:
-            for t in task_queue_stack[0]:
-                logger.debug('Scheduling %s as outer transaction block is '
-                             'successful' % (t.description))
-                t.schedule()
+        if successful:
+            if len(task_queue_stack) == 1:
+                for t in task_queue_stack[0]:
+                    logger.debug('Scheduling %s as outer transaction block is '
+                                 'successful' % (t.description))
+                    t.schedule()
 
-            task_queue_stack.pop()
+                task_queue_stack.pop()
+            else:
+                task_queue = task_queue_stack.pop()
+                for t in task_queue:
+                    logger.debug('Promoting task %s to outer transaction block' %
+                                 (t.description))
+                task_queue_stack[-1] += task_queue
         else:
-            task_queue = task_queue_stack.pop()
-            for t in task_queue:
-                logger.debug('Promoting task %s to outer transaction block' %
-                             (t.description))
-            task_queue_stack[-1] += task_queue
-    else:
-        task_queue_stack.pop()
+            task_queue_stack.pop()
 
 
 task = partial(base_task, base=PostTransactionTask)
